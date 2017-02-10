@@ -32,6 +32,24 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "oslversion.h"
 
 #include <vector>
+#if OSL_CPLUSPLUS_VERSION >= 11
+#  include <unordered_set>
+#else
+#  include <boost/unordered_set.hpp>
+#endif
+
+#if OSL_LLVM_VERSION >= 37
+#  define OSL_USE_ORC_JIT 1
+#endif
+#if OSL_USE_ORC_JIT && (OSL_LLVM_VERSION < 36)
+# ifdef _WIN32
+#  pragma message "ORC Jit cannot be used for this version of LLVM. Disabling."
+# else
+#  warning "ORC Jit cannot be used for this version of LLVM. Disabling."
+# endif
+# undef OSL_USE_ORC_JIT
+# define OSL_USE_ORC_JIT 0
+#endif
 
 #ifdef LLVM_NAMESPACE
 namespace llvm = LLVM_NAMESPACE;
@@ -63,6 +81,11 @@ OSL_NAMESPACE_ENTER
 namespace pvt {   // OSL::pvt
 
 
+#if OSL_CPLUSPLUS_VERSION >= 11
+    typedef std::unordered_set<std::string> string_set;
+#else
+    typedef boost::unordered_set<std::string> string_set;
+#endif
 
 
 
@@ -71,7 +94,15 @@ namespace pvt {   // OSL::pvt
 /// generic that it would be useful for any LLVM-JITing app, and is not
 /// tied to OSL internals at all.
 class OSLEXECPUBLIC LLVM_Util {
+#if OSL_USE_ORC_JIT
+    class OrcJIT;
+    typedef OrcJIT *JitEngine;
+#else
+    typedef llvm::ExecutionEngine *JitEngine;
+#endif
+
 public:
+
     LLVM_Util (int debuglevel=0);
     ~LLVM_Util ();
 
@@ -96,12 +127,12 @@ public:
     void module (llvm::Module *m) { m_llvm_module = m; }
 
     /// Create a new empty module.
-    llvm::Module *new_module (const char *id = "default");
+    llvm::Module *new_module (const char *id = "default", std::string *err = NULL);
 
     /// Create a new module, populated with functions from the buffer
     /// bitcode[0..size-1].  The name identifies the buffer.  If err is not
     /// NULL, error messages will be stored there.
-    llvm::Module *module_from_bitcode (const char *bitcode, size_t size,
+    llvm::Module *module_from_bitcode (const unsigned char *bitcode, size_t size,
                                        const std::string &name=std::string(),
                                        std::string *err=NULL);
 
@@ -143,11 +174,11 @@ public:
     /// Create a new JITing ExecutionEngine and make it the current one.
     /// Return a pointer to the new engine.  If err is not NULL, put any
     /// errors there.
-    llvm::ExecutionEngine *make_jit_execengine (std::string *err=NULL);
+    JitEngine make_jit_execengine (std::string *err=NULL);
 
     /// Return a pointer to the current ExecutionEngine.  Create a JITing
     /// ExecutionEngine if one isn't already set up.
-    llvm::ExecutionEngine *execengine () {
+    JitEngine execengine () {
         if (! m_llvm_exec)
             make_jit_execengine();
         return m_llvm_exec;
@@ -155,7 +186,7 @@ public:
 
     /// Replace the ExecutionEngine (pass NULL to simply delete the
     /// current one).
-    void execengine (llvm::ExecutionEngine *exec);
+    void execengine (JitEngine exec);
 
     /// Change symbols in the module that are marked as having external
     /// linkage to an alternate linkage that allows them to be discarded if
@@ -163,8 +194,8 @@ public:
     /// with prefix, and that DON'T match anything in the two exceptions
     /// lists.
     void internalize_module_functions (const std::string &prefix,
-                                       const std::vector<std::string> &exceptions,
-                                       const std::vector<std::string> &moreexceptions);
+                                       const string_set &exceptions,
+                                       const string_set &moreexceptions);
 
     /// Setup LLVM optimization passes.
     void setup_optimization_passes (int optlevel);
@@ -487,6 +518,7 @@ public:
 private:
     class MemoryManager;
     class IRBuilder;
+    class PassManager;
 
     void SetupLLVM ();
     IRBuilder& builder();
@@ -498,9 +530,9 @@ private:
     IRBuilder *m_builder;
     MemoryManager *m_llvm_jitmm;
     llvm::Function *m_current_function;
-    llvm::legacy::PassManager *m_llvm_module_passes;
-    llvm::legacy::FunctionPassManager *m_llvm_func_passes;
-    llvm::ExecutionEngine *m_llvm_exec;
+    PassManager *m_llvm_passes;
+    JitEngine m_llvm_exec;
+
     std::vector<llvm::BasicBlock *> m_return_block;     // stack for func call
     std::vector<llvm::BasicBlock *> m_loop_after_block; // stack for break
     std::vector<llvm::BasicBlock *> m_loop_step_block;  // stack for continue

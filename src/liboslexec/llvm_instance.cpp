@@ -38,6 +38,9 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "oslexec_pvt.h"
 #include "../liboslcomp/oslcomp_pvt.h"
 #include "backendllvm.h"
+#ifndef OSL_LLVM_NO_BITCODE
+#  include "llvm_ops_bc.h"
+#endif
 
 // Create extrenal declarations for all built-in funcs we may call from LLVM
 #define DECL(name,signature) extern "C" void name();
@@ -108,8 +111,6 @@ Schematically, we want to create code that resembles the following:
 
 */
 
-extern int osl_llvm_compiled_ops_size;
-extern char osl_llvm_compiled_ops_block[];
 
 using namespace OSL::pvt;
 
@@ -139,7 +140,7 @@ typedef std::unordered_map<std::string,HelperFuncRecord> HelperFuncMap;
 HelperFuncMap llvm_helper_function_map;
 atomic_int llvm_helper_function_map_initialized (0);
 spin_mutex llvm_helper_function_map_mutex;
-std::vector<std::string> external_function_names;
+string_set external_function_names;
 
 
 
@@ -153,10 +154,13 @@ initialize_llvm_helper_function_map ()
         return;
 #define DECL(name,signature) \
     llvm_helper_function_map[#name] = HelperFuncRecord(signature,name); \
-    external_function_names.push_back (#name);
+    external_function_names.insert (#name);
 #include "builtindecl.h"
 #undef DECL
 
+#ifdef OSL_SPLIT_BITCODES
+    init_function_bytecodes();
+#endif
     llvm_helper_function_map_initialized = 1;
 }
 
@@ -1092,13 +1096,13 @@ BackendLLVM::run ()
     // entry points, as well as for all the external functions that are
     // just declarations (not definitions) in the module (which we have
     // conveniently stashed in external_function_names).
-    std::vector<std::string> entry_function_names;
-    entry_function_names.push_back (ll.func_name(init_func));
+    string_set entry_function_names;
+    entry_function_names.insert (ll.func_name(init_func));
     for (int layer = 0; layer < nlayers; ++layer) {
         // set_inst (layer);
         llvm::Function* f = funcs[layer];
         if (f && group().is_entry_layer(layer))
-            entry_function_names.push_back (ll.func_name(f));
+            entry_function_names.insert (ll.func_name(f));
     }
     ll.internalize_module_functions ("osl_", external_function_names, entry_function_names);
 

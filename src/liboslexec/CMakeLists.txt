@@ -50,18 +50,19 @@ FLEX_BISON ( ../liboslcomp/osllex.l ../liboslcomp/oslgram.y osl liboslexec_srcs 
 
 SET ( CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -D__STDC_LIMIT_MACROS -D__STDC_CONSTANT_MACROS" )
 
-MACRO ( LLVM_COMPILE llvm_src srclist )
+MACRO ( LLVM_COMPILE llvm_src llvm_bc_cpp_file )
     GET_FILENAME_COMPONENT ( llvmsrc_we ${llvm_src} NAME_WE )
-    SET ( llvm_asm "${CMAKE_CURRENT_BINARY_DIR}/${llvmsrc_we}.s" )
-    SET ( llvm_bc "${CMAKE_CURRENT_BINARY_DIR}/${llvmsrc_we}.bc" )
-    SET ( llvm_bc_cpp "${CMAKE_CURRENT_BINARY_DIR}/${llvmsrc_we}.bc.cpp" )
+    SET ( llvm_asm "${CMAKE_CURRENT_BINARY_DIR}/${llvmsrc_we}.ll" )
+    SET ( llvm_bc "${CMAKE_CURRENT_BINARY_DIR}/${llvmsrc_we}_bc" )
+    SET ( llvm_bc_h "${llvm_bc}.h" )
+    SET ( llvm_bc_cpp "${llvm_bc}.cpp" )
+    SET ( ${llvm_bc_cpp_file} ${llvm_bc_cpp} )
     if (VERBOSE)
         MESSAGE (STATUS "LLVM_COMPILE in=${llvm_src}")
         MESSAGE (STATUS "LLVM_COMPILE asm=${llvm_asm}")
-        MESSAGE (STATUS "LLVM_COMPILE bc=${llvm_bc}")
+        MESSAGE (STATUS "LLVM_COMPILE h=${llvm_bc_h}")
         MESSAGE (STATUS "LLVM_COMPILE cpp=${llvm_bc_cpp}")
     endif ()
-    SET ( ${srclist} ${${srclist}} ${llvm_bc_cpp} )
     if (OSL_NAMESPACE)
         SET (LLVM_COMPILE_FLAGS ${LLVM_COMPILE_FLAGS} "-DOSL_NAMESPACE=${OSL_NAMESPACE}")
     endif ()
@@ -80,16 +81,19 @@ MACRO ( LLVM_COMPILE llvm_src srclist )
     # Figure out what program we will use to make the bitcode.
     if (NOT LLVM_BC_GENERATOR)
         FIND_PROGRAM(LLVM_BC_GENERATOR NAMES "clang++" PATHS "${LLVM_DIRECTORY}/bin" NO_DEFAULT_PATH NO_CMAKE_SYSTEM_PATH NO_SYSTEM_ENVIRONMENT_PATH NO_CMAKE_ENVIRONMENT_PATH NO_CMAKE_PATH)
-    endif ()
-    # If that didn't work, look anywhere
-    if (NOT LLVM_BC_GENERATOR)
-        # Wasn't in their build, look anywhere
-        FIND_PROGRAM(LLVM_BC_GENERATOR NAMES clang++ llvm-g++)
+        # If that didn't work, look anywhere
+        if (NOT LLVM_BC_GENERATOR)
+            # Wasn't in their build, look anywhere
+            FIND_PROGRAM(LLVM_BC_GENERATOR NAMES clang++ llvm-g++)
+        endif ()
+        if (NOT LLVM_BC_GENERATOR)
+            message (FATAL_ERROR "You must have a valid llvm bitcode generator (clang++) somewhere.")
+        endif ()
+        set (llvm_bc_generator_custom FALSE)
+    else ()
+        set( llvm_bc_generator_custom TRUE)
     endif ()
 
-    if (NOT LLVM_BC_GENERATOR)
-        message (FATAL_ERROR "You must have a valid llvm bitcode generator (clang++) somewhere.")
-    endif ()
     if (VERBOSE)
         message (STATUS "Using ${LLVM_BC_GENERATOR} to generate bitcode.")
     endif()
@@ -98,7 +102,7 @@ MACRO ( LLVM_COMPILE llvm_src srclist )
     # LLVM/libc++ installed -- for some reason, LLVM 3.4 wasn't finding it,
     # so in that specific case, append another -I to point it in the right
     # direction.
-    if (APPLE AND ${LLVM_BC_GENERATOR} MATCHES ".*clang.*")
+    if (APPLE AND NOT llvm_bc_generator_custom AND ${LLVM_BC_GENERATOR} MATCHES ".*clang.*")
         EXEC_PROGRAM ( "${LLVM_BC_GENERATOR}" ARGS --version OUTPUT_VARIABLE MY_CLANG_VERSION )
         string (REGEX REPLACE "clang version ([0-9][.][0-9]+).*" "\\1" MY_CLANG_VERSION "${MY_CLANG_VERSION}")
         if ((${MY_CLANG_VERSION} VERSION_GREATER "3.3")
@@ -108,9 +112,9 @@ MACRO ( LLVM_COMPILE llvm_src srclist )
         endif ()
     endif ()
 
-    # Command to turn the .cpp file into LLVM assembly language .s, into
-    # LLVM bitcode .bc, then back into a C++ file with the bc embedded!
-    ADD_CUSTOM_COMMAND ( OUTPUT ${llvm_bc_cpp}
+    # Command to turn the .cpp file into an LLVM IR file (.ll)
+    ADD_CUSTOM_COMMAND ( OUTPUT ${llvm_asm}
+      PRE_BUILD
       COMMAND ${LLVM_BC_GENERATOR}
           ${LLVM_COMPILE_FLAGS}
           "-I${CMAKE_CURRENT_SOURCE_DIR}"
@@ -122,15 +126,40 @@ MACRO ( LLVM_COMPILE llvm_src srclist )
           -DOSL_COMPILING_TO_BITCODE=1
           -Wno-deprecated-register
           -O3 -fno-math-errno -S -emit-llvm -o ${llvm_asm} ${llvm_src}
-      COMMAND "${LLVM_DIRECTORY}/bin/llvm-as" -f -o ${llvm_bc} ${llvm_asm}
-      COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/serialize-bc.bash" ${llvm_bc} ${llvm_bc_cpp}
       MAIN_DEPENDENCY ${llvm_src}
       DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/serialize-bc.bash"
       WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" )
+
+    if (OSL_SPLIT_BITCODES)
+      ADD_DEFINITIONS (-DOSL_SPLIT_BITCODES=1)
+      SET ( llvm_to_cxx_msg "Splitting bytecode into separate buffers" )
+      SET ( llvm_to_cxx_arg -func=osl_ -func=OSL:: -func=OpenImageIO:: )
+    else ()
+      SET ( llvm_to_cxx_msg "Generating monolithic bytecode" )
+      SET ( llvm_to_cxx_arg "" )
+    endif ()
+
+    # Command to turn the .ll file into a C++ file of bitcode buffers, possibly
+    # splitting each function into its own buffer (-DOSL_SPLIT_BITCODES=1).
+    ADD_EXECUTABLE ( llvm_to_cxx llvm_to_cxx.cpp)
+    TARGET_LINK_LIBRARIES ( llvm_to_cxx ${LLVM_LIBRARY} ${LLVM_LIBRARIES}
+                            ${LLVM_LDFLAGS} ${LLVM_SYSTEM_LIBRARIES} ${LLVM_READER_LIBRARIES} )
+    TARGET_INCLUDE_DIRECTORIES ( llvm_to_cxx PRIVATE ${CMAKE_BINARY_DIR}/include/OSL )
+    TARGET_COMPILE_OPTIONS ( llvm_to_cxx PRIVATE ${LLVM_COMPILE_FLAGS} )
+    ADD_CUSTOM_COMMAND ( OUTPUT "${llvm_bc_h}" "${llvm_bc_cpp}"
+                         COMMAND llvm_to_cxx
+                         ARGS ${llvm_asm} ${llvm_to_cxx_arg} -prefix=osl_llvm_compiled_ops -o ${llvm_bc}
+                         MAIN_DEPENDENCY ${llvm_src}
+                         DEPENDS ${llvm_asm} llvm_to_cxx
+                         COMMENT "${llvm_to_cxx_msg}"
+                         WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
+                         VERBATIM )
 ENDMACRO ( )
 
+
 if (USE_LLVM_BITCODE)
-    LLVM_COMPILE ( llvm_ops.cpp liboslexec_srcs )
+    LLVM_COMPILE ( llvm_ops.cpp llvm_bc_cpp_file )
+    LIST(APPEND liboslexec_srcs ${llvm_bc_cpp_file})
 else ()
     # With MSVC/Mingw, we don't compile llvm_ops.cpp to LLVM bitcode, due
     # to clang being unable to compile MSVC C++ header files at this time.

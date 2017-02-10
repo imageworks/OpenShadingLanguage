@@ -43,8 +43,11 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #endif
 
 // Use MCJIT for LLVM 3.6 and beyind, old JIT for earlier
-#define USE_MCJIT   (OSL_LLVM_VERSION >= 36)
-#define USE_OLD_JIT (OSL_LLVM_VERSION <  36)
+#if !OSL_USE_ORC_JIT
+#  define USE_OLD_JIT (OSL_LLVM_VERSION <  36)
+#  define USE_MCJIT   (OSL_LLVM_VERSION >= 36)
+#  define OSL_USE_ORC_JIT 0
+#endif
 
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/DerivedTypes.h>
@@ -73,10 +76,15 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <llvm/Support/ManagedStatic.h>
 #include <llvm/Support/MemoryBuffer.h>
 #include <llvm/ExecutionEngine/GenericValue.h>
-#if USE_MCJIT
+#if OSL_USE_ORC_JIT
+#  include <llvm/Support/DynamicLibrary.h>
+#  include <llvm/ExecutionEngine/Orc/CompileUtils.h>
+#  include <llvm/ExecutionEngine/Orc/IRCompileLayer.h>
+#  include <llvm/ExecutionEngine/Orc/LazyEmittingLayer.h>
+#  include <llvm/ExecutionEngine/Orc/ObjectLinkingLayer.h>
+#elif USE_MCJIT
 #  include <llvm/ExecutionEngine/MCJIT.h>
-#endif
-#if USE_OLD_JIT
+#elif USE_OLD_JIT
 #  include <llvm/ExecutionEngine/JIT.h>
 #  include <llvm/ExecutionEngine/JITMemoryManager.h>
 #endif
@@ -98,6 +106,10 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #endif
 #if OSL_LLVM_VERSION >= 39
 #  include <llvm/Transforms/Scalar/GVN.h>
+#endif
+
+#ifndef OSL_LLVM_NO_BITCODE
+#  include "llvm_ops_bc.h"
 #endif
 
 OSL_NAMESPACE_ENTER
@@ -172,6 +184,30 @@ LLVM_Util::total_jit_memory_held ()
 #endif
     return jitmem;
 }
+
+
+#if OSL_LLVM_VERSION >= 35
+#if OSL_LLVM_VERSION < 40
+inline bool error_string (const std::error_code &err, std::string *str) {
+    if (err) {
+        if (str) *str = err.message();
+        return true;
+    }
+    return false;
+}
+#else
+inline bool error_string (llvm::Error err, std::string *str) {
+    if (err) {
+        if (str) {
+            llvm::handleAllErrors(std::move(err),
+                      [str](llvm::ErrorInfoBase &E) { *str += E.message(); });
+        }
+        return true;
+    }
+    return false;
+}
+#endif
+#endif
 
 
 
@@ -316,6 +352,277 @@ public:
 };
 #endif
 
+#if OSL_USE_ORC_JIT
+
+class Target {
+    const llvm::Target *m_target;
+    const llvm::Triple m_triple;
+
+    static Target* on_err (std::string *out_err, const std::string *info = NULL) {
+        if (out_err) {
+            *out_err = "Target could not be created";
+            if (info) {
+                out_err->append(": ");
+                out_err->append(*info);
+            }
+        }
+        return NULL;
+    }
+
+    static Target*
+    create (std::string *out_err) {
+        // Use C++ static initializer to make sure this is run once.
+        llvm::sys::DynamicLibrary::LoadLibraryPermanently(NULL);
+
+        std::string err;
+        const llvm::Triple trp (llvm::sys::getProcessTriple());
+        const llvm::Target *trg = llvm::TargetRegistry::lookupTarget
+                                                     (trp.getTriple(), err);
+        return trg ? new Target(trg, trp) : (Target*)on_err (out_err);
+    }
+
+    Target (const llvm::Target *target, const llvm::Triple &triple) :
+        m_target(target), m_triple(triple) {}
+
+public:
+    llvm::TargetMachine *createMachine(std::string *out_err, unsigned opt_level = llvm::CodeGenOpt::Level::Default) {
+        const std::string cpu;
+        const std::string features;
+        const llvm::TargetOptions options = llvm::TargetOptions();
+        const llvm::CodeModel::Model code_model = llvm::CodeModel::JITDefault;
+        llvm::TargetMachine *machine =
+            m_target->createTargetMachine(m_triple.str(), cpu, features,
+                                   options, llvm::Optional<llvm::Reloc::Model>(),
+                                   code_model);
+        return machine ? machine : (llvm::TargetMachine*)on_err (out_err);
+    }
+
+    // Use a single instance that all JIT's will reference
+    // Pointer to handle possible runtime failure (PPC I'm looking at you).
+    static Target *instance (std::string *err = NULL) {
+        static std::unique_ptr<Target> s_target(create(err));
+        return s_target.get();
+    }
+
+    const llvm::Triple &triple() { return m_triple; }
+};
+
+
+class LLVM_Util::OrcJIT {
+
+#if OSL_LLVM_VERSION < 40
+    typedef llvm::orc::TargetAddress JITTargetAddress;
+    typedef llvm::orc::JITSymbol JITSymbol;
+    typedef llvm::RuntimeDyld::SymbolInfo JITEvaluatedSymbol;
+    typedef llvm::RuntimeDyld::SymbolResolver JITSymbolResolver;
+#else
+    typedef llvm::JITTargetAddress JITTargetAddress;
+    typedef llvm::JITSymbol JITSymbol;
+    typedef llvm::JITSymbol JITEvaluatedSymbol;
+    typedef llvm::JITSymbolResolver JITSymbolResolver;
+#endif
+
+    // Simple JITSymbolResolver that looks back into its parent
+    //
+    // The difference between findSymbol and findSymbolInLogicalDylib is that
+    // findSymbol should ignore hidden/weak and findSymbolInLogicalDylib should not
+    // Ignore this fact for now, possibly ever.
+    struct SimpleResolver : public JITSymbolResolver {
+        OrcJIT &m_parent;
+    public:
+        SimpleResolver(OrcJIT &p) : m_parent(p) {}
+
+        JITEvaluatedSymbol findSymbol (const std::string &name) {
+            uint64_t ptr = cast_ptr(m_parent.m_lookup_sym(name.substr(1)));
+            return ptr ? JITEvaluatedSymbol(ptr, llvm::JITSymbolFlags::Exported) : NULL;
+        }
+        JITEvaluatedSymbol findSymbolInLogicalDylib (const std::string &name) {
+            uint64_t ptr = llvm::RTDyldMemoryManager::getSymbolAddressInProcess(name);
+            return ptr ? JITEvaluatedSymbol(ptr, llvm::JITSymbolFlags::Exported) : NULL;
+        }
+
+        // Work around:
+        // ORC expecting a pointer to this object (we pass it a reference)
+        //
+        SimpleResolver& operator * () { return *this; }
+    };
+
+    typedef void* (*LazyLookup)(const std::string &);
+    static void* default_lookup (const std::string&) { return NULL; }
+
+    static void* cast_ptr (uintptr_t ptr) { return reinterpret_cast<void*>(ptr); }
+    static uintptr_t cast_ptr (void *ptr) { return reinterpret_cast<uintptr_t>(ptr); }
+
+public:
+    // This doesn't implement on-request or lazy compilation.
+    // It uses Orc's eager compilation layer directly - IRCompileLayer.
+    // It also uses the basis object layer - ObjectLinkingLayer - directly.
+    // Orc's SimpleCompiler is used compile the module; it runs LLVM's
+    // codegen and MC on the module, producing an object file in memory. No
+    // IR-level optimizations are run by the JIT.
+    typedef llvm::orc::SimpleCompiler SimpleCompiler;
+    typedef llvm::orc::ObjectLinkingLayer<> ObjectLayer;
+    typedef llvm::orc::IRCompileLayer<ObjectLayer> CompileLayer;
+
+    // More layers to come....
+    typedef CompileLayer FinalCompileLayer;
+    typedef FinalCompileLayer::ModuleSetHandleT ModuleHandle;
+
+    FinalCompileLayer &compiler() { return m_compile_layer; }
+
+    OrcJIT(llvm::TargetMachine *machine, llvm::Module *module, LLVMMemoryManager* mem_manager) :
+        m_machine(machine), m_mem_manager(mem_manager), m_lookup_sym(default_lookup),
+        m_data_layout(machine->createDataLayout()),
+        m_compile_layer(m_object_layer, SimpleCompiler(*machine)),
+        m_symbol_resolver(*this), m_linker(*module) {
+            module->setDataLayout (m_data_layout);
+        }
+
+    static OrcJIT*
+    create(LLVMMemoryManager *mem_manager, llvm::Module *module, std::string *out_err,
+           unsigned opt_level = llvm::CodeGenOpt::Level::Default) {
+        if (Target *target = Target::instance(out_err)) {
+            if (llvm::TargetMachine *M = target->createMachine(out_err, opt_level))
+                return new OrcJIT(M, module, mem_manager);
+        }
+        return NULL;
+    }
+
+    // Add a module to the JIT.
+    ModuleHandle addModule(llvm::Module *module) {
+        llvm::SmallVector<llvm::Module*, 1> mod_set(1, module);
+        auto H = compiler().addModuleSet(mod_set, m_mem_manager, // std::unique_ptr<MemoryManager>(new MemoryManager(m_mem_manager))
+                                         m_symbol_resolver);
+        m_module_h.push_back(H);
+        return H;
+    }
+
+    // Remove a module from the JIT.
+    void removeModule(ModuleHandle H) {
+        m_module_h.erase(std::find(m_module_h.begin(), m_module_h.end(), H));
+        compiler().removeModuleSet(H);
+    }
+
+    // Get the runtime address of the compiled symbol whose name is given.
+    JITSymbol findSymbol(const std::string name) {
+        std::string mangled;
+        {
+            llvm::raw_string_ostream strm(mangled);
+            llvm::Mangler::getNameWithPrefix(strm, name, m_data_layout);
+        }
+
+        for (auto H : llvm::make_range(m_module_h.rbegin(), m_module_h.rend())) {
+            if (auto sym = m_compile_layer.findSymbolIn(H, mangled, true))
+                return sym;
+        }
+        return NULL;
+    }
+
+    void addSingleModule (llvm::Module *module) {
+        // Currently we know there is only a single module, and adding it more
+        // than once makes little sense.
+        if (!m_module_h.empty ())
+            return;
+        addModule (module);
+    }
+
+    void linkModule (std::unique_ptr<llvm::Module> module) {
+        m_linker.linkInModule(std::move(module));
+    }
+
+    // API matching avoids some ifdefs below
+    void InstallLazyFunctionCreator (LazyLookup func) {
+        m_lookup_sym = func;
+    }
+    void *getPointerToFunction (const llvm::Function *func) {
+        return cast_ptr(findSymbol(func->getName()).getAddress());
+    }
+    const llvm::DataLayout &dataLayout () const { return m_data_layout; }
+
+private:
+    std::unique_ptr<llvm::TargetMachine> m_machine;
+    LLVMMemoryManager *m_mem_manager;
+    LazyLookup m_lookup_sym;
+
+    llvm::DataLayout m_data_layout;
+    ObjectLayer m_object_layer;
+    CompileLayer m_compile_layer;
+    std::vector<ModuleHandle> m_module_h;
+    SimpleResolver m_symbol_resolver;
+    llvm::Linker m_linker;
+};
+#endif
+
+
+
+class LLVM_Util::PassManager : public llvm::legacy::PassManager {
+    llvm::legacy::PassManager m_pass_manager;
+    llvm::legacy::FunctionPassManager *m_fpass_manager;
+    bool m_run_func_pass;
+
+    static void initPassManager(llvm::legacy::PassManagerBase &manager,
+                                llvm::Module *module) {
+        // LLVM keeps changing names and call sequence. This part is easier to
+        // understand if we explicitly break it into individual LLVM versions.
+      #if OSL_LLVM_VERSION >= 37
+            // nothing
+      #elif OSL_LLVM_VERSION >= 36
+            manager.add (new llvm::DataLayoutPass());
+      #elif OSL_LLVM_VERSION == 35
+            manager.add (new llvm::DataLayoutPass(module));
+      #elif OSL_LLVM_VERSION == 34
+            manager.add (new llvm::DataLayout(module));
+      #endif
+    }
+
+public:
+    PassManager(llvm::Module *module) :
+        m_fpass_manager(nullptr), m_run_func_pass(false) {
+        initPassManager(m_pass_manager, module);
+    }
+    ~PassManager() { delete m_fpass_manager; }
+
+    // Create a function pass manager
+    llvm::legacy::FunctionPassManager*
+    createFunctionPass(llvm::Module *module, int optlevel) {
+        ASSERT (m_fpass_manager==nullptr && "Function pass manager already set");
+        m_fpass_manager = new llvm::legacy::FunctionPassManager(module);
+        initPassManager(*m_fpass_manager, module);
+        m_run_func_pass = true;
+        return m_fpass_manager;
+    }
+
+    // Use LLVM's default passes. Must not call createFunctionPass before!
+    void defaultPasses(llvm::Module *module, int optlevel) {
+        createFunctionPass(module, optlevel);
+        // function passes will automatically be run
+        m_run_func_pass = false;
+
+        llvm::PassManagerBuilder builder;
+        builder.OptLevel = optlevel;
+        builder.Inliner = llvm::createFunctionInliningPass();
+        // builder.DisableUnrollLoops = true;
+        builder.populateFunctionPassManager (*m_fpass_manager);
+        builder.populateModulePassManager (m_pass_manager);
+    }
+    
+    // Run the passes over the module
+    void run (llvm::Module &module) {
+        // Using defaultPasses wil run these automatically, otherwise must do
+        // it by hand
+        if (m_fpass_manager && m_run_func_pass) {
+            m_fpass_manager->doInitialization();
+            for (llvm::Function &func : module) {
+                if (!func.isDeclaration())
+                    m_fpass_manager->run(func);
+            }
+            m_fpass_manager->doFinalization();
+        }
+        m_pass_manager.run (module);
+    }
+
+    llvm::legacy::PassManager& modulePass() { return m_pass_manager; }
+};
 
 
 LLVM_Util::LLVM_Util (int debuglevel)
@@ -323,7 +630,7 @@ LLVM_Util::LLVM_Util (int debuglevel)
       m_llvm_context(NULL), m_llvm_module(NULL),
       m_builder(NULL), m_llvm_jitmm(NULL),
       m_current_function(NULL),
-      m_llvm_module_passes(NULL), m_llvm_func_passes(NULL),
+      m_llvm_passes(NULL),
       m_llvm_exec(NULL)
 {
     SetupLLVM ();
@@ -387,8 +694,7 @@ LLVM_Util::LLVM_Util (int debuglevel)
 LLVM_Util::~LLVM_Util ()
 {
     execengine (NULL);
-    delete m_llvm_module_passes;
-    delete m_llvm_func_passes;
+    delete m_llvm_passes;
     delete m_builder;
     module (NULL);
     // DO NOT delete m_llvm_jitmm;  // just the dummy wrapper around the real MM
@@ -412,12 +718,14 @@ LLVM_Util::SetupLLVM ()
 // new versions (>=3.5)don't need this anymore
 
 
-#if USE_MCJIT
+#if OSL_USE_ORC_JIT || USE_MCJIT
     LLVMInitializeNativeTarget();
     LLVMInitializeNativeDisassembler();
     LLVMInitializeNativeAsmPrinter();
     LLVMInitializeNativeAsmParser();
+# if USE_MCJIT
     LLVMLinkInMCJIT();
+# endif
 #else
     llvm::InitializeNativeTarget();
 #endif
@@ -445,44 +753,20 @@ LLVM_Util::SetupLLVM ()
 
 
 llvm::Module *
-LLVM_Util::new_module (const char *id)
+LLVM_Util::new_module (const char *id, std::string *err)
 {
     return new llvm::Module(id, context());
 }
 
 
-
-#if OSL_LLVM_VERSION >= 35
-#if OSL_LLVM_VERSION < 40
-inline bool error_string (const std::error_code &err, std::string *str) {
-    if (err) {
-        if (str) *str = err.message();
-        return true;
-    }
-    return false;
-}
-#else
-inline bool error_string (llvm::Error err, std::string *str) {
-    if (err) {
-        if (str) {
-            llvm::handleAllErrors(std::move(err),
-                      [str](llvm::ErrorInfoBase &E) { *str += E.message(); });
-        }
-        return true;
-    }
-    return false;
-}
-#endif
-#endif
-
-
-
 llvm::Module *
-LLVM_Util::module_from_bitcode (const char *bitcode, size_t size,
+LLVM_Util::module_from_bitcode (const unsigned char *ubytes, size_t size,
                                 const std::string &name, std::string *err)
 {
     if (err)
         err->clear();
+
+    const char *bitcode = reinterpret_cast<const char*>(ubytes);
 
 #if OSL_LLVM_VERSION <= 35 /* Old JIT vvvvvvvvvvvvvvvvvvvvvvvvvvvv */
     llvm::MemoryBuffer* buf =
@@ -590,12 +874,21 @@ LLVM_Util::end_builder ()
 
 
 
-llvm::ExecutionEngine *
+LLVM_Util::JitEngine
 LLVM_Util::make_jit_execengine (std::string *err)
 {
     execengine (NULL);   // delete and clear any existing engine
     if (err)
         err->clear ();
+
+#if OSL_USE_ORC_JIT
+
+    m_llvm_exec = OrcJIT::create(reinterpret_cast<LLVMMemoryManager*>(m_llvm_jitmm),
+                                 m_llvm_module, err);
+    return m_llvm_exec;
+
+#else /* !OSL_USE_ORC_JIT : [USE_OLD_JIT or USE_MCJIT] */
+
 # if OSL_LLVM_VERSION >= 36
     llvm::EngineBuilder engine_builder ((std::unique_ptr<llvm::Module>(module())));
 # else /* < 36: */
@@ -605,15 +898,15 @@ LLVM_Util::make_jit_execengine (std::string *err)
     engine_builder.setEngineKind (llvm::EngineKind::JIT);
     engine_builder.setErrorStr (err);
 
-#if USE_OLD_JIT
+# if USE_OLD_JIT
     engine_builder.setJITMemoryManager (m_llvm_jitmm);
     // N.B. createJIT will take ownership of the the JITMemoryManager!
     engine_builder.setUseMCJIT (0);
-#else
+# else
     // We are actually holding a LLVMMemoryManager
     engine_builder.setMCJITMemoryManager (std::unique_ptr<llvm::RTDyldMemoryManager>
         (new MemoryManager(reinterpret_cast<LLVMMemoryManager*>(m_llvm_jitmm))));
-#endif /* USE_OLD_JIT */
+# endif /* USE_OLD_JIT */
 
     engine_builder.setOptLevel (llvm::CodeGenOpt::Default);
 
@@ -627,12 +920,14 @@ LLVM_Util::make_jit_execengine (std::string *err)
     // destroying the Module & ExecutionEngine.
     m_llvm_exec->DisableLazyCompilation ();
     return m_llvm_exec;
+
+#endif /* OSL_USE_ORC_JIT */
 }
 
 
 
 void
-LLVM_Util::execengine (llvm::ExecutionEngine *exec)
+LLVM_Util::execengine (JitEngine exec)
 {
     delete m_llvm_exec;
     m_llvm_exec = exec;
@@ -644,9 +939,14 @@ void *
 LLVM_Util::getPointerToFunction (llvm::Function *func)
 {
     DASSERT (func && "passed NULL to getPointerToFunction");
-    llvm::ExecutionEngine *exec = execengine();
-    if (USE_MCJIT)
-        exec->finalizeObject ();
+    JitEngine exec = execengine();
+
+#if OSL_USE_ORC_JIT
+    exec->addSingleModule (m_llvm_module);
+#elif USE_MCJIT
+    exec->finalizeObject ();
+#endif
+
     void *f = exec->getPointerToFunction (func);
     ASSERT (f && "could not getPointerToFunction");
     return f;
@@ -657,7 +957,7 @@ LLVM_Util::getPointerToFunction (llvm::Function *func)
 void
 LLVM_Util::InstallLazyFunctionCreator (void* (*P)(const std::string &))
 {
-    llvm::ExecutionEngine *exec = execengine();
+    JitEngine exec = execengine();
     exec->InstallLazyFunctionCreator (P);
 }
 
@@ -666,68 +966,32 @@ LLVM_Util::InstallLazyFunctionCreator (void* (*P)(const std::string &))
 void
 LLVM_Util::setup_optimization_passes (int optlevel)
 {
-    ASSERT (m_llvm_module_passes == NULL && m_llvm_func_passes == NULL);
+    ASSERT (m_llvm_passes == NULL);
 
     // Construct the per-function passes and module-wide (interprocedural
     // optimization) passes.
     //
-    // LLVM keeps changing names and call sequence. This part is easier to
-    // understand if we explicitly break it into individual LLVM versions.
-#if OSL_LLVM_VERSION >= 37
 
-    m_llvm_func_passes = new llvm::legacy::FunctionPassManager(module());
-    llvm::legacy::FunctionPassManager &fpm = (*m_llvm_func_passes);
+    // Is there aany reason to call this before an llvm::Module exists ?
+    llvm::Module *mod = module();
+    m_llvm_passes = new PassManager(mod);
 
-    m_llvm_module_passes = new llvm::legacy::PassManager;
-    llvm::legacy::PassManager &mpm = (*m_llvm_module_passes);
-
-#elif OSL_LLVM_VERSION >= 36
-
-    m_llvm_func_passes = new llvm::legacy::FunctionPassManager(module());
-    llvm::legacy::FunctionPassManager &fpm (*m_llvm_func_passes);
-    fpm.add (new llvm::DataLayoutPass());
-
-    m_llvm_module_passes = new llvm::legacy::PassManager;
-    llvm::legacy::PassManager &mpm (*m_llvm_module_passes);
-    mpm.add (new llvm::DataLayoutPass());
-
-#elif OSL_LLVM_VERSION == 35
-
-    m_llvm_func_passes = new llvm::legacy::FunctionPassManager(module());
-    llvm::legacy::FunctionPassManager &fpm (*m_llvm_func_passes);
-    fpm.add (new llvm::DataLayoutPass(module()));
-
-    m_llvm_module_passes = new llvm::legacy::PassManager;
-    llvm::legacy::PassManager &mpm (*m_llvm_module_passes);
-    mpm.add (new llvm::DataLayoutPass(module()));
-
-#elif OSL_LLVM_VERSION == 34
-
-    m_llvm_func_passes = new llvm::legacy::FunctionPassManager(module());
-    llvm::legacy::FunctionPassManager &fpm (*m_llvm_func_passes);
-    fpm.add (new llvm::DataLayout(module()));
-
-    m_llvm_module_passes = new llvm::legacy::PassManager;
-    llvm::legacy::PassManager &mpm (*m_llvm_module_passes);
-    mpm.add (new llvm::DataLayout(module()));
-
-#endif
-
-    if (optlevel >= 1 && optlevel <= 3) {
-        // For LLVM 3.0 and higher, llvm_optimize 1-3 means to use the
-        // same set of optimizations as clang -O1, -O2, -O3
-        llvm::PassManagerBuilder builder;
-        builder.OptLevel = optlevel;
-        builder.Inliner = llvm::createFunctionInliningPass();
-        // builder.DisableUnrollLoops = true;
-        builder.populateFunctionPassManager (fpm);
-        builder.populateModulePassManager (mpm);
-    } else {
+    // Should everything other than 0 branch to else ?
+    if (optlevel <= 0 || optlevel >= 4) {
         // Unknown choices for llvm_optimize: use the same basic
         // set of passes that we always have.
 
+        llvm::legacy::PassManager &mpm = m_llvm_passes->modulePass();
+
+#if OSL_LLVM_VERSION <= 34 // Prior behavior, not longer required
         // Always add verifier?
         mpm.add (llvm::createVerifierPass());
+#endif
+
+        // Strip and merge functions.
+        mpm.add (llvm::createStripDeadPrototypesPass());
+        mpm.add (llvm::createMergeFunctionsPass());
+
         // Simplify the call graph if possible (deleting unreachable blocks, etc.)
         mpm.add (llvm::createCFGSimplificationPass());
         // Change memory references to registers
@@ -756,6 +1020,15 @@ LLVM_Util::setup_optimization_passes (int optlevel)
         mpm.add (llvm::createCFGSimplificationPass());
         // Try to make stuff into registers one last time.
         mpm.add (llvm::createPromoteMemoryToRegisterPass());
+
+#if OSL_LLVM_VERSION > 34
+        // Verify the resulting module ...
+        // mpm.add (llvm::createVerifierPass());
+#endif
+    } else {
+        // For LLVM 3.0 and higher, llvm_optimize 1-3 means to use the
+        // same set of optimizations as clang -O1, -O2, -O3
+        m_llvm_passes->defaultPasses(mod, optlevel);
     }
 }
 
@@ -772,17 +1045,15 @@ LLVM_Util::do_optimize (std::string *out_err)
         return;
 #endif
 
-    m_llvm_func_passes->doInitialization();
-    m_llvm_module_passes->run (*m_llvm_module);
-    m_llvm_func_passes->doFinalization();
+    m_llvm_passes->run (*m_llvm_module);
 }
 
 
 
 void
 LLVM_Util::internalize_module_functions (const std::string &prefix,
-                                         const std::vector<std::string> &exceptions,
-                                         const std::vector<std::string> &moreexceptions)
+                                         const string_set &exceptions,
+                                         const string_set &moreexceptions)
 {
 #if OSL_LLVM_VERSION < 40
     for (llvm::Module::iterator iter = module()->begin(); iter != module()->end(); iter++) {
@@ -794,22 +1065,9 @@ LLVM_Util::internalize_module_functions (const std::string &prefix,
         std::string symname = sym->getName();
         if (prefix.size() && ! OIIO::Strutil::starts_with(symname, prefix))
             continue;
-        bool needed = false;
-        for (size_t i = 0, e = exceptions.size(); i < e; ++i)
-            if (sym->getName() == exceptions[i]) {
-                needed = true;
-                // std::cout << "    necessary LLVM module function "
-                //           << sym->getName().str() << "\n";
-                break;
-            }
-        for (size_t i = 0, e = moreexceptions.size(); i < e; ++i)
-            if (sym->getName() == moreexceptions[i]) {
-                needed = true;
-                // std::cout << "    necessary LLVM module function "
-                //           << sym->getName().str() << "\n";
-                break;
-            }
-        if (!needed) {
+
+        if (! exceptions.count(sym->getName()) &&
+            ! moreexceptions.count(sym->getName())) {
             llvm::GlobalValue::LinkageTypes linkage = sym->getLinkage();
             // std::cout << "    unnecessary LLVM module function "
             //           << sym->getName().str() << " linkage " << int(linkage) << "\n";
@@ -832,13 +1090,8 @@ LLVM_Util::internalize_module_functions (const std::string &prefix,
         std::string symname = sym->getName();
         if (prefix.size() && ! OIIO::Strutil::starts_with(symname, prefix))
             continue;
-        bool needed = false;
-        for (size_t i = 0, e = exceptions.size(); i < e; ++i)
-            if (sym->getName() == exceptions[i]) {
-                needed = true;
-                break;
-            }
-        if (! needed) {
+
+        if (! exceptions.count(sym->getName())) {
             llvm::GlobalValue::LinkageTypes linkage = sym->getLinkage();
             // std::cout << "    unnecessary LLVM global " << sym->getName().str()
             //           << " linkage " << int(linkage) << "\n";
@@ -1276,8 +1529,67 @@ llvm::Value *
 LLVM_Util::call_function (const char *name, llvm::Value **args, int nargs)
 {
     llvm::Function *func = module()->getFunction (name);
-    if (! func)
-        std::cerr << "Couldn't find function " << name << "\n";
+    if (! func) {
+#ifdef OSL_SPLIT_BITCODES
+        if (const bytecode_func *bf = bytecode_for_function (name)) {
+
+            std::string err;
+            std::unique_ptr<llvm::Module> mod(
+                                module_from_bitcode (bf->first, bf->second,
+                                                     name, &err));
+            if (! mod) {
+                std::cerr << "Couldn't load bitcode for '" << name << "'\n";
+                return NULL;
+            }
+#if !OSL_USE_ORC_JIT
+            func = mod->getFunction (name);
+            if (! func) {
+                std::cerr << "Function '" << name << "' not in module '"
+# if OSL_LLVM_VERSION >= 36
+                          << mod->getName().str ()
+# else
+                          << mod->getModuleIdentifier ()
+# endif
+                          << "'\n" << "  : " << err << '\n';
+
+                return NULL;
+            }
+
+# if OSL_LLVM_VERSION >= 35
+            LLVMErr ec = func->materialize();
+            if (error_string (std::move(ec), &err))
+# else
+            if (func->Materialize(&err))
+# endif
+            {
+                std::cerr << "Error materializing function '"
+                          << name << "'\n" << "  : " << err << '\n';
+                return NULL;
+            }
+            // Merge the module into the active base module.
+            // -mod- cannot be used after this call.
+# if OSL_LLVM_VERSION >= 38
+            if (llvm::Linker::linkModules (*m_llvm_module, std::move(mod)))
+# else
+            if (llvm::Linker::LinkModules (m_llvm_module, mod.get(),
+                                           llvm::Linker::DestroySource, &err))
+# endif
+            {
+                std::cerr << "Couldn't link modules\n";
+                return NULL;
+            }
+
+#else /* OSL_USE_ORC_JIT */
+            execengine()->linkModule(std::move(mod));
+#endif
+            // Grab the function from the merged module
+            func = m_llvm_module->getFunction (name);
+            if (func)
+                return call_function (func, args, nargs);
+        }
+#endif /* OSL_SPLIT_BITCODES */
+        std::cerr << "Couldn't find function '" << name << "'\n";
+    }
     return call_function (func, args, nargs);
 }
 
