@@ -415,6 +415,35 @@ int hash (point p, float t) BUILTIN;
 
 
 // Displacement functions
+void displace (vector offset) {
+    P += offset;
+    N = normalize (calculatenormal (P));
+}
+void displace (float amp) {
+    displace (amp * N);
+}
+void displace (string space, float amp) {
+    float len = length (transform (space, N));
+    displace (amp * len * N);
+}
+void displace (string space, vector offset) {
+    displace (transform (space, "common", offset));
+}
+
+void bump (vector offset) {
+    N = normalize (calculatenormal (P+offset));
+}
+void bump (float amp) {
+    bump (amp * N);
+}
+void bump (string space, float amp) {
+    float len = length (transform (space, N));
+    bump (amp * len * N);
+}
+void bump (string space, vector offset) {
+    bump (transform (space, "common", offset));
+}
+
 
 
 // String functions

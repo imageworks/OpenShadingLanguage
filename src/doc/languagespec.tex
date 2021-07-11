@@ -3857,26 +3857,28 @@ computed (using {\cf filterwidth()}).
 \index{functions!displacement}
 
 \apiitem{void {\ce displace} (float amp) \\
+void {\ce displace} (vector offset) \\
 void {\ce displace} (string space, float amp) \\
-void {\ce displace} (vector offset)}
+void {\ce displace} (string space, vector offset)}
 \indexapi{displace()}
 
 Displace the surface in the direction of the shading normal \N by
-\emph{amp} units as measured in the named \emph{space} (or \commonspace
-if none is specified).  Alternately, the surface may be moved by a fully
-general \emph{offset}, which does not need to be in the direction of the
-surface normal.
+\emph{amp} units, or by an arbitrary offset vector.
+If an optional \emph{space} name is supplied, the amplitude or offset
+are expressed in the named coordinte system (rather than the default
+of \commonspace).
 
-In either case, this function both displaces the surface and adjusts the
-shading normal \N to be the new surface normal of the displaced surface
+For all cases, the surface itself is displaced and the shadingnormal \N is
+adjusted to be the new surface normal of the displaced surface
 (properly handling both continuously smooth surfaces as well as
 interpolated normals on faceted geometry, without introducing faceting
 artifacts).
 \apiend
 
 \apiitem{void {\ce bump} (float amp) \\
+void {\ce bump} (vector offset) \\
 void {\ce bump} (string space, float amp) \\
-void {\ce bump} (vector offset)}
+void {\ce bump} (string space, vector offset)}
 \indexapi{bump()}
 
 Adjust the shading normal \N to be the surface normal as if the

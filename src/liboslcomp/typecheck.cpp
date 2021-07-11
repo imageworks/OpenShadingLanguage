@@ -2097,7 +2097,6 @@ ASTfunction_call::typecheck(TypeSpec expected)
 static const char * builtin_func_args [] = {
     "area", "fp", "!deriv", NULL,
     "arraylength", "i?[]", NULL,
-    "bump", "xf", "xsf", "xv", "!deriv", NULL,
     "calculatenormal", "vp", "!deriv", NULL,
     "cellnoise", NOISE_ARGS, NULL,
     "concat", "sss", /*"ss.",*/ NULL,   // FIXME -- further checking
@@ -2107,7 +2106,6 @@ static const char * builtin_func_args [] = {
     "Dx", "ff", "vp", "vv", "vn", "cc", "!deriv", NULL,
     "Dy", "ff", "vp", "vv", "vn", "cc", "!deriv", NULL,
     "Dz", "ff", "vp", "vv", "vn", "cc", "!deriv", NULL,
-    "displace", "xf", "xsf", "xv", "!deriv", NULL,
     "environment", "fsv.", "fsvvv.","csv.", "csvvv.",
                "vsv.", "vsvvv.", "!tex", "!rw", "!deriv", NULL,
     "error", "xs*", "!printf", NULL,
