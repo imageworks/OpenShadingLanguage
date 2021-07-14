@@ -25,7 +25,7 @@ shade_image (ShadingSystem &shadingsys, ShaderGroup &group,
              const ShaderGlobals *defaultsg,
              OIIO::ImageBuf &buf, cspan<ustring> outputs,
              ShadeImageLocations shadelocations,
-             OIIO::ROI roi, OIIO::ImageBufAlgo::parallel_image_options popt)
+             OIIO::ROI roi, OIIO::parallel_options popt)
 {
     using namespace OIIO;
     using namespace ImageBufAlgo;
